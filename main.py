@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
 from datetime import datetime
 import pandas as pd
 import requests
@@ -19,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 앱이 서버 상태를 확인하는 핑(Ping) 주소
 @app.get("/api/health")
 def health_check():
     return {"status": "online"}
@@ -27,13 +25,14 @@ def health_check():
 FMP_KEY = "bqW2GNXRz0Kr1a02eNPaFNID6ASutzCU"
 GNEWS_KEY = "651b77a31242ef76da2e1567a9975c7e"
 
-def get_yf_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "*/*"
-    })
-    return session
+def fetch_json(url: str):
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return None
 
 def safe_translate(text: str) -> str:
     if not text or not str(text).strip() or text == "정보 없음" or text == "N/A":
@@ -53,151 +52,83 @@ def extract_three_sentences(text: str) -> str:
 @app.get("/api/ticker/{ticker}")
 def get_ticker_data(ticker: str, period: str = "3mo"):
     try:
-        session = get_yf_session()
         ticker = ticker.upper()
-        stock = yf.Ticker(ticker, session=session)
         
-        # 1. 뼈대(차트) 데이터 먼저 시도 (가장 차단 확률이 낮음)
-        try:
-            hist = stock.history(period=period)
-        except Exception:
-            hist = pd.DataFrame()
-
-        if hist.empty:
-            return {"status": "error", "message": "없는 티커이거나 현재 통신망에서 차단되었습니다."}
-
-        prices = hist['Close'].tolist()
+        # 1. 야후를 버리고 FMP API로 현재가 및 정보 즉시 호출
+        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={FMP_KEY}"
+        quote_data = fetch_json(quote_url)
         
-        # 2. 야후 기업 정보 (에러 발생 시 서버가 죽지 않고 빈 딕셔너리로 패스)
-        try:
-            data = stock.info
-            if not isinstance(data, dict):
-                data = {}
-        except Exception:
-            data = {}
-
-        # 3. FMP 무료 주가/실적 API 보완 (야후가 막혔을 때를 대비한 스페어 타이어)
-        fmp_quote = {}
-        try:
-            q_url = f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={FMP_KEY}"
-            q_res = requests.get(q_url, timeout=3)
-            if q_res.status_code == 200:
-                q_json = q_res.json()
-                if isinstance(q_json, list) and len(q_json) > 0:
-                    fmp_quote = q_json[0]
-        except Exception:
-            pass
-
-        krw_rate = 1350.0
-        try:
-            krw_ticker = yf.Ticker("KRW=X", session=session)
-            krw_info = krw_ticker.info
-            if isinstance(krw_info, dict):
-                krw_rate = krw_info.get("regularMarketPrice", 1350.0)
-        except:
-            pass
+        if not quote_data or len(quote_data) == 0:
+            return {"status": "error", "message": "없는 티커이거나 상장 폐지된 종목입니다."}
+            
+        quote = quote_data[0]
+        current_price = quote.get("price", "N/A")
+        raw_pe = quote.get("pe")
+        formatted_pe = round(raw_pe, 2) if isinstance(raw_pe, (int, float)) else "N/A"
         
-        # 기술적 지표 연산 (오류 원천 차단)
-        ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], []
+        # 실적 발표일 파싱
+        next_earnings = quote.get("earningsAnnouncement", "미정")
+        if next_earnings and next_earnings != "미정":
+            next_earnings = next_earnings.split('T')[0]
+
+        # 2. 야후를 버리고 FMP API로 1년치 차트 역사적 데이터 호출
+        hist_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries=300&apikey={FMP_KEY}"
+        hist_data_res = fetch_json(hist_url)
+        
+        prices, ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], [], []
         current_rsi = "N/A"
         
-        try:
-            if len(hist) >= 50:
-                ma50 = hist['Close'].rolling(window=50).mean().fillna(0).tolist()
-            if len(hist) >= 200:
-                ma200 = hist['Close'].rolling(window=200).mean().fillna(0).tolist()
-            if len(hist) >= 20:
-                ma20 = hist['Close'].rolling(window=20).mean()
-                std20 = hist['Close'].rolling(window=20).std()
-                upper_band = (ma20 + (std20 * 2)).fillna(0).tolist()
-                lower_band = (ma20 - (std20 * 2)).fillna(0).tolist()
-            if len(hist) >= 26:
-                ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
-                ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
+        if hist_data_res and "historical" in hist_data_res:
+            # FMP는 최신 날짜가 맨 앞이므로, 차트를 위해 역순(과거->최신)으로 뒤집음
+            hist_list = hist_data_res["historical"][::-1]
+            df = pd.DataFrame(hist_list)
+            
+            slice_map = {'1d': 1, '5d': 5, '3mo': 63, '1y': 252, '5y': 1260}
+            limit = slice_map.get(period, 63)
+            
+            prices_full = df['close']
+            
+            if len(prices_full) >= 50:
+                df['ma50'] = prices_full.rolling(window=50).mean().fillna(0)
+            if len(prices_full) >= 200:
+                df['ma200'] = prices_full.rolling(window=200).mean().fillna(0)
+            if len(prices_full) >= 20:
+                df['ma20'] = prices_full.rolling(window=20).mean()
+                df['std20'] = prices_full.rolling(window=20).std()
+                df['upper'] = (df['ma20'] + (df['std20'] * 2)).fillna(0)
+                df['lower'] = (df['ma20'] - (df['std20'] * 2)).fillna(0)
+            if len(prices_full) >= 26:
+                ema12 = prices_full.ewm(span=12, adjust=False).mean()
+                ema26 = prices_full.ewm(span=26, adjust=False).mean()
                 macd_line = ema12 - ema26
                 signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                macd_histogram = (macd_line - signal_line).fillna(0).tolist()
-            if len(hist) >= 14:
-                delta = hist['Close'].diff()
+                df['macd_hist'] = (macd_line - signal_line).fillna(0)
+            if len(prices_full) >= 14:
+                delta = prices_full.diff()
                 gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
                 loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
                 rs = gain / loss
                 rsi_series = 100 - (100 / (1 + rs))
                 if not pd.isna(rsi_series.iloc[-1]):
                     current_rsi = round(rsi_series.iloc[-1], 2)
-        except:
-            pass
-        
-        # 데이터 병합 (FMP를 우선시하고 없으면 야후 데이터 사용)
-        current_price = fmp_quote.get("price", data.get("currentPrice", data.get("regularMarketPrice", "N/A")))
-        raw_pe = fmp_quote.get("pe", data.get("forwardPE", "N/A"))
-        formatted_pe = round(raw_pe, 2) if isinstance(raw_pe, (int, float)) else "N/A"
-        
-        raw_pbr = data.get("priceToBook", "N/A")
-        formatted_pbr = round(raw_pbr, 2) if isinstance(raw_pbr, (int, float)) else "N/A"
-        raw_psr = data.get("priceToSalesTrailing12Months", "N/A")
-        formatted_psr = round(raw_psr, 2) if isinstance(raw_psr, (int, float)) else "N/A"
-
-        sector = data.get("sector", "N/A")
-        industry = data.get("industry", "N/A")
-        
-        sector_ko_map = {
-            "Technology": "기술 (IT)", "Financial Services": "금융", "Healthcare": "헬스케어", 
-            "Consumer Cyclical": "자유소비재", "Industrials": "산업재", "Communication Services": "통신", 
-            "Consumer Defensive": "필수소비재", "Energy": "에너지", "Basic Materials": "소재", 
-            "Real Estate": "부동산", "Utilities": "유틸리티"
-        }
-        sector_ko = sector_ko_map.get(sector, sector)
-        industry_ko = safe_translate(industry) if industry != "N/A" else "N/A"
-
-        health_eval = "데이터 부족으로 진단 불가"
-        if isinstance(raw_pe, (int, float)):
-            if raw_pe < 0: health_eval = "현재 적자 상태 (펀더멘털 주의)"
-            else:
-                if sector in ["Technology", "Healthcare", "Communication Services"]:
-                    if raw_pe <= 25: health_eval = "성장주 업계 평균 대비 저평가 (건전)"
-                    elif raw_pe <= 40: health_eval = "성장주 업계 평균 수준 (보통)"
-                    else: health_eval = "성장주 업계 대비 고평가 (과열 의심)"
-                else:
-                    if raw_pe <= 15: health_eval = "시장 평균 대비 저평가 (건전)"
-                    elif raw_pe <= 25: health_eval = "시장 평균 수준 (보통)"
-                    else: health_eval = "시장 평균 대비 고평가 (과열 의심)"
-
-        def format_price(val):
-            return round(val, 2) if isinstance(val, (int, float)) else "N/A"
             
-        target_mean = format_price(data.get("targetMeanPrice", "N/A"))
-        target_high = format_price(data.get("targetHighPrice", "N/A"))
-        target_low = format_price(data.get("targetLowPrice", "N/A"))
-        recommendation = data.get("recommendationKey", "N/A")
-        if recommendation != "N/A":
-            rec_map = {"buy": "매수", "strong_buy": "강력 매수", "hold": "보유", "sell": "매도", "strong_sell": "강력 매도"}
-            recommendation = rec_map.get(recommendation.lower(), recommendation.upper())
+            df_sliced = df.tail(limit)
+            prices = df_sliced['close'].tolist()
+            if 'ma50' in df.columns: ma50 = df_sliced['ma50'].tolist()
+            if 'ma200' in df.columns: ma200 = df_sliced['ma200'].tolist()
+            if 'upper' in df.columns: upper_band = df_sliced['upper'].tolist()
+            if 'lower' in df.columns: lower_band = df_sliced['lower'].tolist()
+            if 'macd_hist' in df.columns: macd_histogram = df_sliced['macd_hist'].tolist()
 
-        # 실적 발표일 처리
-        next_earnings = fmp_quote.get("earningsAnnouncement", "미정")
-        if next_earnings and next_earnings != "미정":
-            next_earnings = next_earnings.split('T')[0]
-            
-        recent_earnings = "미정"
-        try:
-            earnings = stock.get_earnings_dates(limit=10)
-            if earnings is not None and not earnings.empty:
-                now = pd.Timestamp.now(tz=earnings.index.tz)
-                past_dates = earnings[earnings.index < now]
-                if not past_dates.empty: 
-                    recent_earnings = past_dates.index[0].strftime('%Y-%m-%d')
-        except:
-            pass
+        # 원/달러 환율 (FMP USDKRW)
+        krw_rate = 1350.0
+        krw_res = fetch_json(f"https://financialmodelingprep.com/api/v3/quote/USDKRW?apikey={FMP_KEY}")
+        if krw_res and len(krw_res) > 0:
+            krw_rate = krw_res[0].get("price", 1350.0)
 
-        # 기업 개요 3문장 파싱
-        desc_full = data.get("longBusinessSummary", "N/A")
-        if desc_full != "N/A":
-            summary_en = extract_three_sentences(desc_full)
-            summary_ko = safe_translate(summary_en)
-        else:
-            summary_en = "데이터 센터 접근 차단으로 기업 개요를 불러올 수 없습니다."
-            summary_ko = summary_en
+        # FMP 프로필이 막혔으므로, 빈 값 처리
+        summary_en = "무료 API 한계로 기업 개요 텍스트는 제공되지 않습니다."
+        summary_ko = summary_en
 
         # 뉴스 파싱 (GNews 3문장 요약)
         news_data_list = []
@@ -227,28 +158,18 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "ticker": ticker,
             "current_price": current_price, 
             "forward_pe": formatted_pe,
-            "pbr": formatted_pbr,
-            "psr": formatted_psr,
-            "sector_ko": sector_ko, 
-            "industry_ko": industry_ko, 
-            "health_eval": health_eval, 
-            "target_mean": target_mean,
-            "target_high": target_high,
-            "target_low": target_low,
-            "recommendation": recommendation,
-            "recent_earnings": recent_earnings,
+            "pbr": "N/A", "psr": "N/A", "sector_ko": "주식", "industry_ko": "주식", 
+            "health_eval": "데이터 부족으로 진단 불가", 
+            "target_mean": "N/A", "target_high": "N/A", "target_low": "N/A", "recommendation": "N/A",
+            "recent_earnings": "미정",
             "next_earnings": next_earnings,
             "current_rsi": current_rsi,
-            "short_ratio": "N/A", 
-            "held_by_institutions": "N/A", 
+            "short_ratio": "N/A", "held_by_institutions": "N/A", 
             "business_summary_en": summary_en,
             "business_summary_ko": summary_ko, 
             "exchange_rate": round(krw_rate, 2), 
             "chart_prices": prices,
-            "ma50": ma50,    
-            "ma200": ma200,
-            "upper_band": upper_band, 
-            "lower_band": lower_band, 
+            "ma50": ma50, "ma200": ma200, "upper_band": upper_band, "lower_band": lower_band, 
             "macd_histogram": macd_histogram,
             "financials": [],
             "news": news_data_list,
@@ -260,35 +181,30 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
 @app.get("/api/macro")
 def get_macro_data(sector_query: str = "economy"):
     try:
-        session = get_yf_session()
-        macro_indicators = {}
+        macro_indicators = {"us10y_yield": 4.25, "vix": 16.5, "exchange_rate": 1350.0, "market_sentiment": "안정"}
         history_data = {"us10y": [], "vix": [], "krw": []}
         
-        try:
-            tnx_ticker = yf.Ticker("^TNX", session=session)
-            vix_ticker = yf.Ticker("^VIX", session=session)
-            krw_ticker = yf.Ticker("KRW=X", session=session)
-            
-            tnx_info = tnx_ticker.info if isinstance(tnx_ticker.info, dict) else {}
-            vix_info = vix_ticker.info if isinstance(vix_ticker.info, dict) else {}
-            krw_info = krw_ticker.info if isinstance(krw_ticker.info, dict) else {}
-            
-            tnx = tnx_info.get("regularMarketPrice", 0.0)
-            vix = vix_info.get("regularMarketPrice", 0.0)
-            krw = krw_info.get("regularMarketPrice", 1350.0)
-            
-            history_data["us10y"] = tnx_ticker.history(period="6mo")['Close'].tolist() if not tnx_ticker.history(period="6mo").empty else []
-            history_data["vix"] = vix_ticker.history(period="6mo")['Close'].tolist() if not vix_ticker.history(period="6mo").empty else []
-            history_data["krw"] = krw_ticker.history(period="6mo")['Close'].tolist() if not krw_ticker.history(period="6mo").empty else []
+        # 3. 매크로 차트도 야후를 버리고 FMP API로 연결 복구
+        def get_fmp_close(symbol):
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}?timeseries=130&apikey={FMP_KEY}"
+            res = fetch_json(url)
+            if res and "historical" in res:
+                return [day["close"] for day in res["historical"][::-1]]
+            return []
 
-            macro_indicators = {
-                "us10y_yield": round(tnx, 2) if tnx else 4.25,
-                "vix": round(vix, 2) if vix else 16.5,
-                "exchange_rate": round(krw, 2),
-                "market_sentiment": "과열 (탐욕)" if vix < 15 else ("안정" if vix < 20 else ("경계 (공포)" if vix < 30 else "극심한 공포"))
-            }
+        try:
+            history_data["us10y"] = get_fmp_close("^TNX")
+            history_data["vix"] = get_fmp_close("^VIX")
+            history_data["krw"] = get_fmp_close("USDKRW")
+            
+            if history_data["us10y"]: macro_indicators["us10y_yield"] = round(history_data["us10y"][-1], 2)
+            if history_data["vix"]: macro_indicators["vix"] = round(history_data["vix"][-1], 2)
+            if history_data["krw"]: macro_indicators["exchange_rate"] = round(history_data["krw"][-1], 2)
+            
+            vix_val = macro_indicators["vix"]
+            macro_indicators["market_sentiment"] = "과열 (탐욕)" if vix_val < 15 else ("안정" if vix_val < 20 else ("경계 (공포)" if vix_val < 30 else "극심한 공포"))
         except:
-            macro_indicators = {"us10y_yield": 4.25, "vix": 16.5, "exchange_rate": 1350.0, "market_sentiment": "안정"}
+            pass
 
         sector_topics = {
             "economy": "economy OR interest rate",
