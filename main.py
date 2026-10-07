@@ -205,7 +205,7 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         if isinstance(data.get("news"), dict) and "articles" in data["news"]:
             for a in data["news"]["articles"]:
                 title_en = a.get("title", "제목 없음")
-                desc_en = a.get("description", "")
+                desc_en = a.get("content", a.get("description", ""))
                 
                 desc_en_3lines = extract_three_sentences(desc_en)
                 
