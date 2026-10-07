@@ -6,6 +6,7 @@ import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor
 import translators as ts
+import html
 
 app = FastAPI()
 
@@ -17,8 +18,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FMP_KEY = "bqW2GNXRz0Kr1a02eNPaFNID6ASutzCU"
 GNEWS_KEY = "651b77a31242ef76da2e1567a9975c7e"
+
+def get_yf_session():
+    # 야후 봇 차단(401 Invalid Crumb) 우회를 위한 브라우저 위장 세션
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive"
+    })
+    return session
 
 def safe_translate(text: str) -> str:
     if not text or not text.strip() or text == "정보 없음" or text == "N/A":
@@ -28,72 +39,77 @@ def safe_translate(text: str) -> str:
     except Exception:
         return text
 
-def fetch_json(url: str):
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            return res.json()
-    except:
-        pass
-    return None
-
 def extract_three_sentences(text: str) -> str:
+    """텍스트를 정확히 3문장으로 잘라내는 함수"""
     if not text:
         return ""
+    # HTML 태그 제거
+    import re
+    text = re.sub(r'<[^>]+>', '', html.unescape(text))
     sentences = text.split('. ')
     return '. '.join(sentences[:3]) + ('.' if len(sentences) >= 3 else '')
-
-# 🔥 API 쓰레기값 방어용 안전 추출 함수 추가
-def get_first_item(data_item):
-    if isinstance(data_item, list) and len(data_item) > 0:
-        return data_item[0]
-    return {}
 
 @app.get("/api/ticker/{ticker}")
 def get_ticker_data(ticker: str, period: str = "3mo"):
     try:
+        session = get_yf_session()
         ticker = ticker.upper()
+        stock = yf.Ticker(ticker, session=session)
+        data = stock.info
         
-        urls = {
-            "profile": f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_KEY}",
-            "quote": f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={FMP_KEY}",
-            "metrics": f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={FMP_KEY}",
-            "income": f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}?period=quarter&limit=8&apikey={FMP_KEY}",
-            "history": f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries=300&apikey={FMP_KEY}",
-            "target": f"https://financialmodelingprep.com/api/v4/price-target-consensus?symbol={ticker}&apikey={FMP_KEY}",
-            "krw": f"https://financialmodelingprep.com/api/v3/quote/USDKRW?apikey={FMP_KEY}",
-            "news": f"https://gnews.io/api/v4/search?q={ticker} stock&lang=en&country=us&max=7&apikey={GNEWS_KEY}"
-        }
+        # 티커 검증 방어 로직
+        if not data or "symbol" not in data:
+            return {"status": "error", "message": "없는 티커이거나 상장 폐지된 종목입니다."}
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            results = list(executor.map(fetch_json, urls.values()))
+        krw_ticker = yf.Ticker("KRW=X", session=session)
+        exchange_rate = krw_ticker.info.get("regularMarketPrice", 1350.0)
         
-        data = dict(zip(urls.keys(), results))
+        hist = stock.history(period=period)
+        prices = hist['Close'].tolist() if not hist.empty else []
         
-        # 🔥 예외 처리 강화: 쓰레기값(dict)이 오면 빈 딕셔너리 리턴
-        profile = get_first_item(data.get("profile"))
-        if not profile or "symbol" not in profile:
-            return {"status": "error", "message": "티커를 찾을 수 없거나 일일 무료 API 한도를 초과했습니다."}
-            
-        quote = get_first_item(data.get("quote"))
-        metrics = get_first_item(data.get("metrics"))
-        targets = get_first_item(data.get("target"))
-        krw_data = get_first_item(data.get("krw"))
+        # 기술적 지표 연산 (이동평균, 볼린저 밴드, MACD, RSI)
+        ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], []
+        current_rsi = "N/A"
         
-        current_price = quote.get("price", "N/A")
-        exchange_rate = krw_data.get("price", 1350.0)
+        if not hist.empty:
+            if len(hist) >= 50:
+                ma50 = hist['Close'].rolling(window=50).mean().fillna(0).tolist()
+            if len(hist) >= 200:
+                ma200 = hist['Close'].rolling(window=200).mean().fillna(0).tolist()
+            if len(hist) >= 20:
+                ma20 = hist['Close'].rolling(window=20).mean()
+                std20 = hist['Close'].rolling(window=20).std()
+                upper_band = (ma20 + (std20 * 2)).fillna(0).tolist()
+                lower_band = (ma20 - (std20 * 2)).fillna(0).tolist()
+            if len(hist) >= 26:
+                ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
+                ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
+                macd_line = ema12 - ema26
+                signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                macd_histogram = (macd_line - signal_line).fillna(0).tolist()
+            if len(hist) >= 14:
+                delta = hist['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi_series = 100 - (100 / (1 + rs))
+                if not pd.isna(rsi_series.iloc[-1]):
+                    current_rsi = round(rsi_series.iloc[-1], 2)
         
-        raw_pe = quote.get("pe")
+        short_ratio = data.get("shortRatio", "N/A")
+        held_by_institutions = data.get("heldPercentInstitutions", "N/A")
+        if isinstance(held_by_institutions, (int, float)):
+            held_by_institutions = round(held_by_institutions * 100, 2)
+        
+        raw_pe = data.get("forwardPE", "N/A")
         formatted_pe = round(raw_pe, 2) if isinstance(raw_pe, (int, float)) else "N/A"
-        
-        raw_pbr = metrics.get("pbRatioTTM")
+        raw_pbr = data.get("priceToBook", "N/A")
         formatted_pbr = round(raw_pbr, 2) if isinstance(raw_pbr, (int, float)) else "N/A"
-        
-        raw_psr = metrics.get("priceToSalesRatioTTM")
+        raw_psr = data.get("priceToSalesTrailing12Months", "N/A")
         formatted_psr = round(raw_psr, 2) if isinstance(raw_psr, (int, float)) else "N/A"
 
-        sector = profile.get("sector", "N/A")
-        industry = profile.get("industry", "N/A")
+        sector = data.get("sector", "N/A")
+        industry = data.get("industry", "N/A")
         
         sector_ko_map = {
             "Technology": "기술 (IT)", "Financial Services": "금융", "Healthcare": "헬스케어", 
@@ -117,83 +133,49 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
                     elif raw_pe <= 25: health_eval = "시장 평균 수준 (보통)"
                     else: health_eval = "시장 평균 대비 고평가 (과열 의심)"
 
-        target_mean = targets.get("targetConsensus", "N/A")
-        target_high = targets.get("targetHigh", "N/A")
-        target_low = targets.get("targetLow", "N/A")
-        
-        rec_val = targets.get("consensus", "N/A")
-        rec_map = {"buy": "매수", "strong_buy": "강력 매수", "hold": "보유", "sell": "매도", "strong_sell": "강력 매도"}
-        recommendation = rec_map.get(str(rec_val).lower(), str(rec_val).upper()) if rec_val != "N/A" else "N/A"
+        def format_price(val):
+            return round(val, 2) if isinstance(val, (int, float)) else "N/A"
+            
+        target_mean = format_price(data.get("targetMeanPrice", "N/A"))
+        target_high = format_price(data.get("targetHighPrice", "N/A"))
+        target_low = format_price(data.get("targetLowPrice", "N/A"))
+        recommendation = data.get("recommendationKey", "N/A")
+        if recommendation != "N/A":
+            rec_map = {"buy": "매수", "strong_buy": "강력 매수", "hold": "보유", "sell": "매도", "strong_sell": "강력 매도"}
+            recommendation = rec_map.get(recommendation.lower(), recommendation.upper())
 
-        next_earnings = quote.get("earningsAnnouncement")
-        if next_earnings:
-            next_earnings = next_earnings.split('T')[0]
-        else:
-            next_earnings = "미정"
-        recent_earnings = "N/A"
-
-        prices = []
-        ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], []
-        current_rsi = "N/A"
-        
-        # 🔥 예외 처리 강화: history가 dict 형태일 때만 처리
-        if isinstance(data.get("history"), dict) and "historical" in data["history"]:
-            hist_data = data["history"]["historical"]
-            hist_data = hist_data[::-1]
-            
-            slice_map = {'1d': 1, '5d': 5, '3mo': 63, '1y': 252, '5y': 1260}
-            limit = slice_map.get(period, 63)
-            
-            df = pd.DataFrame(hist_data)
-            prices_full = df['close']
-            
-            if len(prices_full) >= 50:
-                df['ma50'] = prices_full.rolling(window=50).mean().fillna(0)
-            if len(prices_full) >= 200:
-                df['ma200'] = prices_full.rolling(window=200).mean().fillna(0)
-            if len(prices_full) >= 20:
-                df['ma20'] = prices_full.rolling(window=20).mean()
-                df['std20'] = prices_full.rolling(window=20).std()
-                df['upper'] = (df['ma20'] + (df['std20'] * 2)).fillna(0)
-                df['lower'] = (df['ma20'] - (df['std20'] * 2)).fillna(0)
-            if len(prices_full) >= 26:
-                ema12 = prices_full.ewm(span=12, adjust=False).mean()
-                ema26 = prices_full.ewm(span=26, adjust=False).mean()
-                macd_line = ema12 - ema26
-                signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                df['macd_hist'] = (macd_line - signal_line).fillna(0)
-            if len(prices_full) >= 14:
-                delta = prices_full.diff()
-                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                rs = gain / loss
-                rsi_series = 100 - (100 / (1 + rs))
-                current_rsi = round(rsi_series.iloc[-1], 2) if not pd.isna(rsi_series.iloc[-1]) else "N/A"
-                
-            df_sliced = df.tail(limit)
-            prices = df_sliced['close'].tolist()
-            if 'ma50' in df.columns: ma50 = df_sliced['ma50'].tolist()
-            if 'ma200' in df.columns: ma200 = df_sliced['ma200'].tolist()
-            if 'upper' in df.columns: upper_band = df_sliced['upper'].tolist()
-            if 'lower' in df.columns: lower_band = df_sliced['lower'].tolist()
-            if 'macd_hist' in df.columns: macd_histogram = df_sliced['macd_hist'].tolist()
+        recent_earnings = "미정"
+        next_earnings = "미정"
+        try:
+            earnings = stock.get_earnings_dates(limit=10)
+            if earnings is not None and not earnings.empty:
+                now = pd.Timestamp.now(tz=earnings.index.tz)
+                past_dates = earnings[earnings.index < now]
+                future_dates = earnings[earnings.index >= now]
+                if not past_dates.empty: recent_earnings = past_dates.index[0].strftime('%Y-%m-%d')
+                if not future_dates.empty: next_earnings = future_dates.index[-1].strftime('%Y-%m-%d')
+        except:
+            pass
 
         financials_data = []
-        # 🔥 예외 처리 강화: 리스트일 때만 처리 (에러 딕셔너리 무시)
-        inc_data = data.get("income")
-        if isinstance(inc_data, list):
-            inc_list = inc_data[::-1]
-            for inc in inc_list:
-                date_str = inc.get("date", "").replace("-", ".")[2:7]
-                rev = inc.get("revenue", 0)
-                net = inc.get("netIncome", 0)
-                financials_data.append({
-                    "date": date_str,
-                    "revenue": float(rev) / 1000000000 if rev else 0.0,
-                    "net_income": float(net) / 1000000000 if net else 0.0
-                })
+        try:
+            q_inc = stock.quarterly_income_stmt
+            if q_inc is not None and not q_inc.empty:
+                dates = q_inc.columns[:8].tolist()[::-1]
+                for d in dates:
+                    date_str = d.strftime('%y.%m')
+                    rev = q_inc.loc['Total Revenue', d] if 'Total Revenue' in q_inc.index else 0
+                    net = q_inc.loc['Net Income', d] if 'Net Income' in q_inc.index else 0
+                    financials_data.append({
+                        "date": date_str,
+                        "revenue": float(rev) / 1000000000 if pd.notna(rev) else 0.0,
+                        "net_income": float(net) / 1000000000 if pd.notna(net) else 0.0
+                    })
+        except:
+            pass
 
-        desc_full = profile.get("description", "정보 없음")
+        # 비즈니스 개요: 야후 데이터 기반 3문장 슬라이싱
+        desc_full = data.get("longBusinessSummary", "정보 없음")
         if desc_full and desc_full != "정보 없음":
             summary_en = extract_three_sentences(desc_full)
             summary_ko = safe_translate(summary_en)
@@ -201,30 +183,38 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             summary_en = "기업 개요를 불러올 수 없습니다."
             summary_ko = "기업 개요를 불러올 수 없습니다."
 
+        # GNews API를 통한 고품질 3줄 뉴스 파싱
         news_data_list = []
-        if isinstance(data.get("news"), dict) and "articles" in data["news"]:
-            for a in data["news"]["articles"]:
-                title_en = a.get("title", "제목 없음")
-                desc_en = a.get("content", a.get("description", ""))
-                
-                desc_en_3lines = extract_three_sentences(desc_en)
-                
-                title_ko = safe_translate(title_en)
-                desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
-                
-                news_data_list.append({
-                    "title_en": title_en,
-                    "title_ko": title_ko,
-                    "publisher": a.get("source", {}).get("name", "GNews"),
-                    "link": a.get("url", ""),
-                    "summary_en": desc_en_3lines,
-                    "summary_ko": desc_ko
-                })
+        try:
+            gnews_url = f"https://gnews.io/api/v4/search?q={ticker} stock&lang=en&country=us&max=7&apikey={GNEWS_KEY}"
+            res = requests.get(gnews_url, timeout=5)
+            if res.status_code == 200:
+                articles = res.json().get("articles", [])
+                for a in articles:
+                    title_en = a.get("title", "제목 없음")
+                    # description이 너무 짧은 경우 content를 우선적으로 가져옴
+                    desc_en = a.get("content", a.get("description", ""))
+                    
+                    desc_en_3lines = extract_three_sentences(desc_en)
+                    
+                    title_ko = safe_translate(title_en)
+                    desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
+                    
+                    news_data_list.append({
+                        "title_en": title_en,
+                        "title_ko": title_ko,
+                        "publisher": a.get("source", {}).get("name", "GNews"),
+                        "link": a.get("url", ""),
+                        "summary_en": desc_en_3lines,
+                        "summary_ko": desc_ko
+                    })
+        except:
+            pass
 
         return {
             "status": "success",
             "ticker": ticker,
-            "current_price": current_price, 
+            "current_price": data.get("currentPrice", "N/A"), 
             "forward_pe": formatted_pe,
             "pbr": formatted_pbr,
             "psr": formatted_psr,
@@ -238,8 +228,8 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "recent_earnings": recent_earnings,
             "next_earnings": next_earnings,
             "current_rsi": current_rsi,
-            "short_ratio": "N/A", 
-            "held_by_institutions": "N/A", 
+            "short_ratio": short_ratio, 
+            "held_by_institutions": held_by_institutions, 
             "business_summary_en": summary_en,
             "business_summary_ko": summary_ko, 
             "exchange_rate": round(exchange_rate, 2), 
@@ -254,18 +244,19 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
-        return {"status": "error", "message": f"데이터 처리 중 오류: {str(e)}"}
+        return {"status": "error", "message": f"데이터 로드 중 오류 발생"}
 
 @app.get("/api/macro")
 def get_macro_data(sector_query: str = "economy"):
     try:
+        session = get_yf_session()
         macro_indicators = {}
         history_data = {"us10y": [], "vix": [], "krw": []}
         
         try:
-            tnx_ticker = yf.Ticker("^TNX")
-            vix_ticker = yf.Ticker("^VIX")
-            krw_ticker = yf.Ticker("KRW=X")
+            tnx_ticker = yf.Ticker("^TNX", session=session)
+            vix_ticker = yf.Ticker("^VIX", session=session)
+            krw_ticker = yf.Ticker("KRW=X", session=session)
             
             tnx = tnx_ticker.info.get("regularMarketPrice", 0.0)
             vix = vix_ticker.info.get("regularMarketPrice", 0.0)
@@ -281,7 +272,7 @@ def get_macro_data(sector_query: str = "economy"):
                 "exchange_rate": round(krw, 2),
                 "market_sentiment": "과열 (탐욕)" if vix < 15 else ("안정" if vix < 20 else ("경계 (공포)" if vix < 30 else "극심한 공포"))
             }
-        except Exception:
+        except:
             macro_indicators = {"us10y_yield": 4.25, "vix": 16.5, "exchange_rate": 1350.0, "market_sentiment": "안정"}
 
         sector_topics = {
@@ -296,28 +287,31 @@ def get_macro_data(sector_query: str = "economy"):
         search_term = sector_topics.get(sector_query, "economy")
         news_data_list = []
         
-        gnews_url = f"https://gnews.io/api/v4/search?q={search_term}&lang=en&country=us&max=6&apikey={GNEWS_KEY}"
-        res = requests.get(gnews_url, timeout=5)
-        
-        if res.status_code == 200:
-            articles = res.json().get("articles", [])
-            for a in articles:
-                title_en = a.get("title", "제목 없음")
-                desc_en = a.get("description", "")
-                
-                desc_en_3lines = extract_three_sentences(desc_en)
-                
-                title_ko = safe_translate(title_en)
-                desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
-                
-                news_data_list.append({
-                    "title_en": title_en,
-                    "title_ko": title_ko,
-                    "publisher": a.get("source", {}).get("name", "GNews"),
-                    "link": a.get("url", ""),
-                    "summary_en": desc_en_3lines,
-                    "summary_ko": desc_ko
-                })
+        # 매크로 경제 GNews 파싱 (content 기반 3줄 고정 요약)
+        try:
+            gnews_url = f"https://gnews.io/api/v4/search?q={search_term}&lang=en&country=us&max=6&apikey={GNEWS_KEY}"
+            res = requests.get(gnews_url, timeout=5)
+            if res.status_code == 200:
+                articles = res.json().get("articles", [])
+                for a in articles:
+                    title_en = a.get("title", "제목 없음")
+                    desc_en = a.get("content", a.get("description", ""))
+                    
+                    desc_en_3lines = extract_three_sentences(desc_en)
+                    
+                    title_ko = safe_translate(title_en)
+                    desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
+                    
+                    news_data_list.append({
+                        "title_en": title_en,
+                        "title_ko": title_ko,
+                        "publisher": a.get("source", {}).get("name", "GNews"),
+                        "link": a.get("url", ""),
+                        "summary_en": desc_en_3lines,
+                        "summary_ko": desc_ko
+                    })
+        except:
+            pass
 
         return {
             "status": "success",
@@ -420,38 +414,41 @@ def get_calendar(tickers: str = ""):
     if not tickers:
         return {"status": "success", "calendar": []}
 
+    session = get_yf_session()
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
     calendar_data = []
 
     for t in ticker_list:
         try:
-            profile_url = f"https://financialmodelingprep.com/api/v3/profile/{t}?apikey={FMP_KEY}"
-            quote_url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={FMP_KEY}"
+            stock = yf.Ticker(t, session=session)
+            info = stock.info
             
-            profile_res = fetch_json(profile_url)
-            quote_res = fetch_json(quote_url)
+            next_earnings = "미정"
+            try:
+                earnings = stock.get_earnings_dates(limit=10)
+                if earnings is not None and not earnings.empty:
+                    now = pd.Timestamp.now(tz=earnings.index.tz)
+                    future_dates = earnings[earnings.index >= now]
+                    if not future_dates.empty:
+                        next_earnings = future_dates.index[-1].strftime('%Y-%m-%d')
+            except:
+                pass
             
-            profile = get_first_item(profile_res)
-            quote = get_first_item(quote_res)
+            div_date = info.get("exDividendDate")
+            next_div = datetime.fromtimestamp(div_date).strftime('%Y-%m-%d') if div_date else "배당 없음"
             
-            if profile and quote:
-                next_earnings = quote.get("earningsAnnouncement", "미정")
-                if next_earnings and next_earnings != "미정":
-                    next_earnings = next_earnings.split('T')[0]
-                
-                div_rate = profile.get("lastDiv", 0.0)
-                price = quote.get("price", 1.0)
-                div_yield = round((div_rate / price) * 100, 2) if price and div_rate else "N/A"
-                
-                calendar_data.append({
-                    "ticker": t,
-                    "next_earnings": next_earnings,
-                    "next_dividend": "기업 공식 확인 요망",
-                    "div_rate": div_rate if div_rate else "N/A",
-                    "div_yield": div_yield
-                })
-            else:
-                raise Exception()
+            div_rate = info.get("dividendRate", "N/A")
+            div_yield = info.get("dividendYield", "N/A")
+            if isinstance(div_yield, (float, int)):
+                div_yield = round(div_yield * 100, 2)
+            
+            calendar_data.append({
+                "ticker": t,
+                "next_earnings": next_earnings,
+                "next_dividend": next_div,
+                "div_rate": div_rate,
+                "div_yield": div_yield
+            })
         except:
             calendar_data.append({
                 "ticker": t,
