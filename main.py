@@ -38,11 +38,16 @@ def fetch_json(url: str):
     return None
 
 def extract_three_sentences(text: str) -> str:
-    """뉴스 본문을 정확히 3문장으로 잘라내는 함수"""
     if not text:
         return ""
     sentences = text.split('. ')
     return '. '.join(sentences[:3]) + ('.' if len(sentences) >= 3 else '')
+
+# 🔥 API 쓰레기값 방어용 안전 추출 함수 추가
+def get_first_item(data_item):
+    if isinstance(data_item, list) and len(data_item) > 0:
+        return data_item[0]
+    return {}
 
 @app.get("/api/ticker/{ticker}")
 def get_ticker_data(ticker: str, period: str = "3mo"):
@@ -65,14 +70,15 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         
         data = dict(zip(urls.keys(), results))
         
-        if not data["profile"] or not data["quote"]:
-            return {"status": "error", "message": "티커를 찾을 수 없습니다."}
+        # 🔥 예외 처리 강화: 쓰레기값(dict)이 오면 빈 딕셔너리 리턴
+        profile = get_first_item(data.get("profile"))
+        if not profile or "symbol" not in profile:
+            return {"status": "error", "message": "티커를 찾을 수 없거나 일일 무료 API 한도를 초과했습니다."}
             
-        profile = data["profile"][0]
-        quote = data["quote"][0]
-        metrics = data["metrics"][0] if data["metrics"] else {}
-        targets = data["target"][0] if data["target"] else {}
-        krw_data = data["krw"][0] if data["krw"] else {"price": 1350.0}
+        quote = get_first_item(data.get("quote"))
+        metrics = get_first_item(data.get("metrics"))
+        targets = get_first_item(data.get("target"))
+        krw_data = get_first_item(data.get("krw"))
         
         current_price = quote.get("price", "N/A")
         exchange_rate = krw_data.get("price", 1350.0)
@@ -130,7 +136,8 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], []
         current_rsi = "N/A"
         
-        if data["history"] and "historical" in data["history"]:
+        # 🔥 예외 처리 강화: history가 dict 형태일 때만 처리
+        if isinstance(data.get("history"), dict) and "historical" in data["history"]:
             hist_data = data["history"]["historical"]
             hist_data = hist_data[::-1]
             
@@ -172,9 +179,10 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             if 'macd_hist' in df.columns: macd_histogram = df_sliced['macd_hist'].tolist()
 
         financials_data = []
-        if data["income"]:
-            inc_list = data["income"]
-            inc_list = inc_list[::-1]
+        # 🔥 예외 처리 강화: 리스트일 때만 처리 (에러 딕셔너리 무시)
+        inc_data = data.get("income")
+        if isinstance(inc_data, list):
+            inc_list = inc_data[::-1]
             for inc in inc_list:
                 date_str = inc.get("date", "").replace("-", ".")[2:7]
                 rev = inc.get("revenue", 0)
@@ -194,12 +202,11 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             summary_ko = "기업 개요를 불러올 수 없습니다."
 
         news_data_list = []
-        if data["news"] and "articles" in data["news"]:
+        if isinstance(data.get("news"), dict) and "articles" in data["news"]:
             for a in data["news"]["articles"]:
                 title_en = a.get("title", "제목 없음")
                 desc_en = a.get("description", "")
                 
-                # 뉴스 본문 3줄 고정 파싱
                 desc_en_3lines = extract_three_sentences(desc_en)
                 
                 title_ko = safe_translate(title_en)
@@ -247,7 +254,7 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"데이터 처리 중 오류: {str(e)}"}
 
 @app.get("/api/macro")
 def get_macro_data(sector_query: str = "economy"):
@@ -421,19 +428,19 @@ def get_calendar(tickers: str = ""):
             profile_url = f"https://financialmodelingprep.com/api/v3/profile/{t}?apikey={FMP_KEY}"
             quote_url = f"https://financialmodelingprep.com/api/v3/quote/{t}?apikey={FMP_KEY}"
             
-            profile = requests.get(profile_url).json()
-            quote = requests.get(quote_url).json()
+            profile_res = fetch_json(profile_url)
+            quote_res = fetch_json(quote_url)
+            
+            profile = get_first_item(profile_res)
+            quote = get_first_item(quote_res)
             
             if profile and quote:
-                p_data = profile[0]
-                q_data = quote[0]
-                
-                next_earnings = q_data.get("earningsAnnouncement", "미정")
+                next_earnings = quote.get("earningsAnnouncement", "미정")
                 if next_earnings and next_earnings != "미정":
                     next_earnings = next_earnings.split('T')[0]
                 
-                div_rate = p_data.get("lastDiv", 0.0)
-                price = q_data.get("price", 1.0)
+                div_rate = profile.get("lastDiv", 0.0)
+                price = quote.get("price", 1.0)
                 div_yield = round((div_rate / price) * 100, 2) if price and div_rate else "N/A"
                 
                 calendar_data.append({
