@@ -17,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 발급받은 정식 API 키 세팅
 FMP_KEY = "bqW2GNXRz0Kr1a02eNPaFNID6ASutzCU"
 GNEWS_KEY = "651b77a31242ef76da2e1567a9975c7e"
 
@@ -29,7 +28,6 @@ def safe_translate(text: str) -> str:
     except Exception:
         return text
 
-# 다중 API 병렬(동시) 호출 함수 (속도 10배 향상)
 def fetch_json(url: str):
     try:
         res = requests.get(url, timeout=5)
@@ -39,12 +37,18 @@ def fetch_json(url: str):
         pass
     return None
 
+def extract_three_sentences(text: str) -> str:
+    """뉴스 본문을 정확히 3문장으로 잘라내는 함수"""
+    if not text:
+        return ""
+    sentences = text.split('. ')
+    return '. '.join(sentences[:3]) + ('.' if len(sentences) >= 3 else '')
+
 @app.get("/api/ticker/{ticker}")
 def get_ticker_data(ticker: str, period: str = "3mo"):
     try:
         ticker = ticker.upper()
         
-        # 1. 병렬 데이터 페칭 (FMP + GNews API 동시 호출)
         urls = {
             "profile": f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_KEY}",
             "quote": f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={FMP_KEY}",
@@ -61,7 +65,6 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         
         data = dict(zip(urls.keys(), results))
         
-        # 데이터가 없으면 예외 처리
         if not data["profile"] or not data["quote"]:
             return {"status": "error", "message": "티커를 찾을 수 없습니다."}
             
@@ -71,7 +74,6 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         targets = data["target"][0] if data["target"] else {}
         krw_data = data["krw"][0] if data["krw"] else {"price": 1350.0}
         
-        # 2. 기업 기본 및 재무 정보 (FMP)
         current_price = quote.get("price", "N/A")
         exchange_rate = krw_data.get("price", 1350.0)
         
@@ -122,18 +124,16 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             next_earnings = next_earnings.split('T')[0]
         else:
             next_earnings = "미정"
-        recent_earnings = "N/A" # FMP 무료 티어 한계로 과거 실적일은 생략
+        recent_earnings = "N/A"
 
-        # 3. 차트 및 기술적 지표 연산 (FMP 역사적 데이터 활용)
         prices = []
         ma50, ma200, upper_band, lower_band, macd_histogram = [], [], [], [], []
         current_rsi = "N/A"
         
         if data["history"] and "historical" in data["history"]:
             hist_data = data["history"]["historical"]
-            hist_data = hist_data[::-1] # 과거부터 최신순으로 정렬
+            hist_data = hist_data[::-1]
             
-            # 선택한 period에 맞춰 데이터 슬라이싱
             slice_map = {'1d': 1, '5d': 5, '3mo': 63, '1y': 252, '5y': 1260}
             limit = slice_map.get(period, 63)
             
@@ -171,11 +171,10 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             if 'lower' in df.columns: lower_band = df_sliced['lower'].tolist()
             if 'macd_hist' in df.columns: macd_histogram = df_sliced['macd_hist'].tolist()
 
-        # 4. 분기별 실적 (Income Statement)
         financials_data = []
         if data["income"]:
             inc_list = data["income"]
-            inc_list = inc_list[::-1] # 과거부터
+            inc_list = inc_list[::-1]
             for inc in inc_list:
                 date_str = inc.get("date", "").replace("-", ".")[2:7]
                 rev = inc.get("revenue", 0)
@@ -186,33 +185,32 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
                     "net_income": float(net) / 1000000000 if net else 0.0
                 })
 
-        # 5. 기업 개요 (FMP 비즈니스 모델 요약 파싱 - 앞 3문장만)
         desc_full = profile.get("description", "정보 없음")
         if desc_full and desc_full != "정보 없음":
-            sentences = desc_full.split('. ')
-            summary_en = '. '.join(sentences[:3]) + "."
+            summary_en = extract_three_sentences(desc_full)
             summary_ko = safe_translate(summary_en)
         else:
             summary_en = "기업 개요를 불러올 수 없습니다."
             summary_ko = "기업 개요를 불러올 수 없습니다."
 
-        # 6. 뉴스 (GNews API - 완벽한 본문 추출)
         news_data_list = []
         if data["news"] and "articles" in data["news"]:
             for a in data["news"]["articles"]:
                 title_en = a.get("title", "제목 없음")
                 desc_en = a.get("description", "")
                 
-                # GNews는 실제 본문 요약을 보내주므로 바로 번역 적용
+                # 뉴스 본문 3줄 고정 파싱
+                desc_en_3lines = extract_three_sentences(desc_en)
+                
                 title_ko = safe_translate(title_en)
-                desc_ko = safe_translate(desc_en) if desc_en else "본문 요약이 없습니다."
+                desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
                 
                 news_data_list.append({
                     "title_en": title_en,
                     "title_ko": title_ko,
                     "publisher": a.get("source", {}).get("name", "GNews"),
                     "link": a.get("url", ""),
-                    "summary_en": desc_en,
+                    "summary_en": desc_en_3lines,
                     "summary_ko": desc_ko
                 })
 
@@ -233,8 +231,8 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "recent_earnings": recent_earnings,
             "next_earnings": next_earnings,
             "current_rsi": current_rsi,
-            "short_ratio": "N/A", # FMP 프리미엄 지표
-            "held_by_institutions": "N/A", # FMP 프리미엄 지표
+            "short_ratio": "N/A", 
+            "held_by_institutions": "N/A", 
             "business_summary_en": summary_en,
             "business_summary_ko": summary_ko, 
             "exchange_rate": round(exchange_rate, 2), 
@@ -257,7 +255,6 @@ def get_macro_data(sector_query: str = "economy"):
         macro_indicators = {}
         history_data = {"us10y": [], "vix": [], "krw": []}
         
-        # 매크로 지표의 역사적 데이터는 변동이 적고 Yahoo가 잘 막지 않으므로 유지
         try:
             tnx_ticker = yf.Ticker("^TNX")
             vix_ticker = yf.Ticker("^VIX")
@@ -292,7 +289,6 @@ def get_macro_data(sector_query: str = "economy"):
         search_term = sector_topics.get(sector_query, "economy")
         news_data_list = []
         
-        # GNews API 적용
         gnews_url = f"https://gnews.io/api/v4/search?q={search_term}&lang=en&country=us&max=6&apikey={GNEWS_KEY}"
         res = requests.get(gnews_url, timeout=5)
         
@@ -301,15 +297,18 @@ def get_macro_data(sector_query: str = "economy"):
             for a in articles:
                 title_en = a.get("title", "제목 없음")
                 desc_en = a.get("description", "")
+                
+                desc_en_3lines = extract_three_sentences(desc_en)
+                
                 title_ko = safe_translate(title_en)
-                desc_ko = safe_translate(desc_en) if desc_en else "본문 요약이 없습니다."
+                desc_ko = safe_translate(desc_en_3lines) if desc_en_3lines else "본문 요약이 없습니다."
                 
                 news_data_list.append({
                     "title_en": title_en,
                     "title_ko": title_ko,
                     "publisher": a.get("source", {}).get("name", "GNews"),
                     "link": a.get("url", ""),
-                    "summary_en": desc_en,
+                    "summary_en": desc_en_3lines,
                     "summary_ko": desc_ko
                 })
 
@@ -417,7 +416,6 @@ def get_calendar(tickers: str = ""):
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
     calendar_data = []
 
-    # 캘린더 데이터도 FMP로 교체하여 속도 극대화
     for t in ticker_list:
         try:
             profile_url = f"https://financialmodelingprep.com/api/v3/profile/{t}?apikey={FMP_KEY}"
