@@ -20,6 +20,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 야후 파이낸스 봇 차단 우회용 세션 생성
+def get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    return session
+
 def safe_translate(text: str) -> str:
     if not text or not text.strip() or text == "정보 없음":
         return text
@@ -37,19 +45,23 @@ def process_single_news(item):
     source = item.find('source')
     description = item.find('description')
     
-    title_en = title.text if title is not None else "제목 없음"
-    title_en = html.unescape(title_en)
-    
+    title_en = html.unescape(title.text) if title is not None and title.text else "제목 없음"
     link_url = link.text if link is not None else ""
     publisher = source.text if source is not None else "Yahoo Finance"
     
-    desc_text = description.text if description is not None else "요약 정보가 없습니다."
-    desc_text = html.unescape(desc_text)
+    desc_text = html.unescape(description.text) if description is not None and description.text else ""
+    # HTML 태그 및 불필요한 기사 출처 패턴 강력 제거
     desc_text = re.sub(r'<[^>]+>', '', desc_text)
-    summary_en = desc_text[:250] + "..." if len(desc_text) > 250 else desc_text
+    desc_text = re.sub(r'^\s*([A-Za-z0-9\s]+) \-\s*', '', desc_text)
+    
+    # 제목과 요약이 동일하면 숨김 처리, 다르면 3~4줄 길이(약 150자)로 커팅
+    if not desc_text or desc_text[:20] == title_en[:20]:
+        summary_en = "본문 내용이 제공되지 않았거나 제목과 동일합니다. 링크를 클릭하여 원문을 확인해 주세요."
+    else:
+        summary_en = desc_text[:150] + "..." if len(desc_text) > 150 else desc_text
     
     title_ko = safe_translate(title_en)
-    summary_ko = safe_translate(summary_en)
+    summary_ko = safe_translate(summary_en) if "링크를 클릭하여" not in summary_en else summary_en
     
     return {
         "title_en": title_en,
@@ -63,10 +75,11 @@ def process_single_news(item):
 @app.get("/api/ticker/{ticker}")
 def get_ticker_data(ticker: str, period: str = "3mo"):
     try:
-        stock = yf.Ticker(ticker)
+        session = get_yf_session()
+        stock = yf.Ticker(ticker, session=session)
         data = stock.info
         
-        krw_ticker = yf.Ticker("KRW=X")
+        krw_ticker = yf.Ticker("KRW=X", session=session)
         exchange_rate = krw_ticker.info.get("regularMarketPrice", 1350.0)
         
         hist = stock.history(period=period)
@@ -90,6 +103,16 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         else:
             upper_band = [0] * len(prices)
             lower_band = [0] * len(prices)
+
+        # MACD 연산
+        if not hist.empty and len(hist) >= 26:
+            ema12 = hist['Close'].ewm(span=12, adjust=False).mean()
+            ema26 = hist['Close'].ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            macd_histogram = (macd_line - signal_line).fillna(0).tolist()
+        else:
+            macd_histogram = [0] * len(prices)
 
         current_rsi = "N/A"
         if not hist.empty and len(hist) >= 14:
@@ -127,17 +150,12 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
 
         health_eval = "데이터 부족으로 진단 불가"
         if isinstance(raw_pe, (int, float)):
-            if raw_pe < 0:
-                health_eval = "현재 적자 상태 (동종 업계 대비 펀더멘털 주의)"
+            if raw_pe < 0: health_eval = "현재 적자 상태 (동종 업계 대비 펀더멘털 주의)"
             else:
                 if sector in ["Technology", "Healthcare", "Communication Services"]:
                     if raw_pe <= 25: health_eval = "성장주 업계 평균 대비 저평가 (건전)"
                     elif raw_pe <= 40: health_eval = "성장주 업계 평균 수준 (보통)"
                     else: health_eval = "성장주 업계 대비 고평가 (과열 의심)"
-                elif sector in ["Financial Services", "Energy", "Basic Materials"]:
-                    if raw_pe <= 10: health_eval = "가치주 업계 평균 대비 저평가 (건전)"
-                    elif raw_pe <= 15: health_eval = "가치주 업계 평균 수준 (보통)"
-                    else: health_eval = "가치주 업계 대비 고평가 (주의)"
                 else:
                     if raw_pe <= 15: health_eval = "시장 평균 대비 저평가 (건전)"
                     elif raw_pe <= 25: health_eval = "시장 평균 수준 (보통)"
@@ -163,7 +181,6 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
                 now = pd.Timestamp.now(tz=earnings.index.tz)
                 past_dates = earnings[earnings.index < now]
                 future_dates = earnings[earnings.index >= now]
-                
                 if not past_dates.empty: recent_earnings = past_dates.index[0].strftime('%Y-%m-%d')
                 if not future_dates.empty: next_earnings = future_dates.index[-1].strftime('%Y-%m-%d')
         except:
@@ -186,23 +203,22 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
         except Exception:
             pass
 
-        summary_en = data.get("longBusinessSummary", "정보 없음")
-        summary_en = html.unescape(summary_en)
-        if summary_en != "정보 없음":
-            sentences = summary_en.split('. ')
-            translated_sentences = []
-            for s in sentences:
-                if s.strip():
-                    translated_sentences.append(safe_translate(s.strip()))
-            summary_ko = '. '.join(translated_sentences)
+        # 기업 개요 핵심 비즈니스 모델만 추출 (3문장 제한)
+        full_summary_en = html.unescape(data.get("longBusinessSummary", "정보 없음"))
+        if full_summary_en != "정보 없음":
+            sentences = full_summary_en.split('. ')
+            core_business_en = '. '.join(sentences[:3]) + "."
+            summary_ko = safe_translate(core_business_en)
+            summary_en = core_business_en
         else:
+            summary_en = "기업 개요를 불러올 수 없습니다."
             summary_ko = "기업 개요를 불러올 수 없습니다."
 
         news_data = []
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
             rss_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
-            response = requests.get(rss_url, headers=headers, timeout=5)
+            response = requests.get(rss_url, headers=headers, timeout=10)
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 raw_items = root.findall('./channel/item')[:7]
@@ -238,6 +254,7 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
             "ma200": ma200,
             "upper_band": upper_band, 
             "lower_band": lower_band, 
+            "macd_histogram": macd_histogram,
             "financials": financials_data,
             "news": news_data,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -248,25 +265,21 @@ def get_ticker_data(ticker: str, period: str = "3mo"):
 @app.get("/api/macro")
 def get_macro_data(sector_query: str = "economy"):
     try:
+        session = get_yf_session()
         macro_indicators = {}
         history_data = {"us10y": [], "vix": [], "krw": []}
-        
         try:
-            tnx_ticker = yf.Ticker("^TNX")
-            vix_ticker = yf.Ticker("^VIX")
-            krw_ticker = yf.Ticker("KRW=X")
+            tnx_ticker = yf.Ticker("^TNX", session=session)
+            vix_ticker = yf.Ticker("^VIX", session=session)
+            krw_ticker = yf.Ticker("KRW=X", session=session)
             
             tnx = tnx_ticker.info.get("regularMarketPrice", 0.0)
             vix = vix_ticker.info.get("regularMarketPrice", 0.0)
             krw = krw_ticker.info.get("regularMarketPrice", 1350.0)
             
-            tnx_hist = tnx_ticker.history(period="6mo")
-            vix_hist = vix_ticker.history(period="6mo")
-            krw_hist = krw_ticker.history(period="6mo")
-            
-            history_data["us10y"] = tnx_hist['Close'].tolist() if not tnx_hist.empty else []
-            history_data["vix"] = vix_hist['Close'].tolist() if not vix_hist.empty else []
-            history_data["krw"] = krw_hist['Close'].tolist() if not krw_hist.empty else []
+            history_data["us10y"] = tnx_ticker.history(period="6mo")['Close'].tolist() if not tnx_ticker.history(period="6mo").empty else []
+            history_data["vix"] = vix_ticker.history(period="6mo")['Close'].tolist() if not vix_ticker.history(period="6mo").empty else []
+            history_data["krw"] = krw_ticker.history(period="6mo")['Close'].tolist() if not krw_ticker.history(period="6mo").empty else []
 
             macro_indicators = {
                 "us10y_yield": round(tnx, 2) if tnx else 4.25,
@@ -291,7 +304,7 @@ def get_macro_data(sector_query: str = "economy"):
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
             rss_url = f"https://news.google.com/rss/search?q={search_term}&hl=en-US&gl=US&ceid=US:en"
-            res = requests.get(rss_url, headers=headers, timeout=5)
+            res = requests.get(rss_url, headers=headers, timeout=10)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
                 raw_items = root.findall('./channel/item')[:6]
@@ -314,7 +327,7 @@ def get_macro_data(sector_query: str = "economy"):
 def get_gurus_data():
     return {
         "status": "success",
-        "disclaimer": "해당 데이터는 프로토타입 구현을 위한 최근 13F 공시 기준 하드코딩 데이터입니다. 실시간 동기화를 위해서는 추후 SEC 공시 전용 유료 API 연동이 필요합니다.",
+        "disclaimer": "해당 데이터는 프로토타입 구현을 위한 최근 13F 공시 기준 하드코딩 데이터입니다.",
         "gurus": [
             {
                 "name": "워런 버핏 (Berkshire Hathaway) 🛡️ 방어/가치",
@@ -324,108 +337,73 @@ def get_gurus_data():
                     {"company": "American Express", "ticker": "AXP", "percent": 11.2},
                     {"company": "Bank of America", "ticker": "BAC", "percent": 10.8},
                     {"company": "Coca-Cola", "ticker": "KO", "percent": 8.5},
-                    {"company": "Chevron", "ticker": "CVX", "percent": 5.4},
-                    {"company": "Occidental Petroleum", "ticker": "OXY", "percent": 4.1},
-                    {"company": "Kraft Heinz", "ticker": "KHC", "percent": 3.2},
-                    {"company": "Moody's", "ticker": "MCO", "percent": 2.9},
-                    {"company": "Chubb", "ticker": "CB", "percent": 2.5},
-                    {"company": "DaVita", "ticker": "DVA", "percent": 1.1}
+                    {"company": "Chevron", "ticker": "CVX", "percent": 5.4}
                 ]
             },
             {
                 "name": "스탠리 드루켄밀러 (Duquesne) ⚔️ 공격/매크로",
-                "summary": "엔비디아 비중을 크게 줄인 뒤, 중소형 AI 인프라 및 전력망 관련주로 수익 실현 모델 전환. 이커머스와 통신 인프라 비중 지속 확대.",
+                "summary": "엔비디아 비중을 크게 줄인 뒤, 중소형 AI 인프라 및 전력망 관련주로 수익 실현 모델 전환.",
                 "top_holdings": [
                     {"company": "Microsoft", "ticker": "MSFT", "percent": 14.1},
                     {"company": "Coupang", "ticker": "CPNG", "percent": 9.8},
                     {"company": "Vistra Corp", "ticker": "VST", "percent": 8.5},
                     {"company": "Coherent", "ticker": "COHR", "percent": 7.2},
-                    {"company": "Seagate", "ticker": "STX", "percent": 5.9},
-                    {"company": "NVIDIA", "ticker": "NVDA", "percent": 4.5},
-                    {"company": "Arista Networks", "ticker": "ANET", "percent": 3.8},
-                    {"company": "Kinetik", "ticker": "KNTK", "percent": 3.1},
-                    {"company": "Broadcom", "ticker": "AVGO", "percent": 2.9},
-                    {"company": "News Corp", "ticker": "NWS", "percent": 2.0}
+                    {"company": "Seagate", "ticker": "STX", "percent": 5.9}
                 ]
             },
             {
                 "name": "캐시 우드 (ARK Invest) 🚀 초공격/혁신성장",
-                "summary": "테슬라 지속 매수 및 코인베이스, 로블록스 등 혁신 파괴적 기술, 크립토/메타버스 섹터의 폭락장 저가 매수에 집중.",
+                "summary": "테슬라 지속 매수 및 코인베이스, 로블록스 등 혁신 파괴적 기술 섹터 저가 매수에 집중.",
                 "top_holdings": [
                     {"company": "Tesla", "ticker": "TSLA", "percent": 9.5},
                     {"company": "Coinbase", "ticker": "COIN", "percent": 8.1},
                     {"company": "Roku", "ticker": "ROKU", "percent": 7.3},
                     {"company": "Block", "ticker": "SQ", "percent": 6.2},
-                    {"company": "Roblox", "ticker": "RBLX", "percent": 5.0},
-                    {"company": "CRISPR", "ticker": "CRSP", "percent": 4.8},
-                    {"company": "UiPath", "ticker": "PATH", "percent": 4.5},
-                    {"company": "Palantir", "ticker": "PLTR", "percent": 3.9},
-                    {"company": "Shopify", "ticker": "SHOP", "percent": 3.5},
-                    {"company": "DraftKings", "ticker": "DKNG", "percent": 3.0}
+                    {"company": "Roblox", "ticker": "RBLX", "percent": 5.0}
                 ]
             },
             {
                 "name": "레이 달리오 (Bridgewater) 🛡️ 방어/올웨더",
-                "summary": "거시 경제 사이클에 맞춘 인덱스 및 ETF 중심의 분산 투자. 최근 신흥국 ETF와 소비재 기업의 비중을 점진적으로 높임.",
+                "summary": "거시 경제 사이클에 맞춘 인덱스 및 ETF 중심의 분산 투자. 최근 신흥국 ETF 비중 확대.",
                 "top_holdings": [
                     {"company": "iShares Core S&P 500", "ticker": "IVV", "percent": 5.8},
                     {"company": "Emerging Markets ETF", "ticker": "IEMG", "percent": 5.2},
                     {"company": "Alphabet", "ticker": "GOOGL", "percent": 3.1},
                     {"company": "Meta Platforms", "ticker": "META", "percent": 2.9},
-                    {"company": "Procter & Gamble", "ticker": "PG", "percent": 2.5},
-                    {"company": "Johnson & Johnson", "ticker": "JNJ", "percent": 2.4},
-                    {"company": "PepsiCo", "ticker": "PEP", "percent": 2.2},
-                    {"company": "McDonald's", "ticker": "MCD", "percent": 2.0},
-                    {"company": "Walmart", "ticker": "WMT", "percent": 1.9},
-                    {"company": "Costco", "ticker": "COST", "percent": 1.8}
+                    {"company": "Procter & Gamble", "ticker": "PG", "percent": 2.5}
                 ]
             },
             {
                 "name": "빌 애크먼 (Pershing Square) ⚔️ 집중/행동주의",
-                "summary": "극소수의 고품질 우량 기업에 자본을 집중하는 전략. 치폴레와 알파벳의 지분을 다수 보유 중이며 호텔/부동산 섹터도 비중 유지.",
+                "summary": "극소수의 고품질 우량 기업에 자본을 집중하는 전략. 치폴레와 알파벳의 지분 다수 보유.",
                 "top_holdings": [
                     {"company": "Chipotle", "ticker": "CMG", "percent": 20.5},
                     {"company": "Hilton", "ticker": "HLT", "percent": 18.2},
                     {"company": "Restaurant Brands", "ticker": "QSR", "percent": 17.1},
                     {"company": "Alphabet (Class C)", "ticker": "GOOG", "percent": 13.5},
-                    {"company": "Canadian Pacific", "ticker": "CP", "percent": 12.0},
-                    {"company": "Howard Hughes", "ticker": "HHH", "percent": 11.2},
-                    {"company": "Alphabet (Class A)", "ticker": "GOOGL", "percent": 5.5},
-                    {"company": "Brookfield", "ticker": "BN", "percent": 1.0},
-                    {"company": "Ford", "ticker": "F", "percent": 0.5},
-                    {"company": "Lowe's", "ticker": "LOW", "percent": 0.5}
+                    {"company": "Canadian Pacific", "ticker": "CP", "percent": 12.0}
                 ]
             },
             {
                 "name": "마이클 버리 (Scion Asset) 🔄 역발상/가치",
-                "summary": "중국 거대 테크 기업(알리바바, 바이두 등)에 대한 강력한 역발상 배팅 유지 및 헬스케어, 결제 인프라 등 저평가 섹터 집중.",
+                "summary": "중국 거대 테크 기업에 대한 강력한 역발상 배팅 유지 및 결제 인프라 등 저평가 섹터 집중.",
                 "top_holdings": [
                     {"company": "Alibaba", "ticker": "BABA", "percent": 21.3},
                     {"company": "JD.com", "ticker": "JD", "percent": 15.5},
                     {"company": "Baidu", "ticker": "BIDU", "percent": 12.0},
                     {"company": "HCA Healthcare", "ticker": "HCA", "percent": 8.5},
-                    {"company": "Citigroup", "ticker": "C", "percent": 7.2},
-                    {"company": "Block", "ticker": "SQ", "percent": 6.0},
-                    {"company": "Cigna", "ticker": "CI", "percent": 5.5},
-                    {"company": "Advance Auto Parts", "ticker": "AAP", "percent": 4.8},
-                    {"company": "Vital Energy", "ticker": "VTLE", "percent": 4.0},
-                    {"company": "MGM Resorts", "ticker": "MGM", "percent": 3.5}
+                    {"company": "Citigroup", "ticker": "C", "percent": 7.2}
                 ]
             },
             {
                 "name": "켄 그리핀 (Citadel) 🧮 퀀트/초분산",
-                "summary": "빅테크 중심의 콜/풋 옵션 양방향 헷징 전략. 수천 개의 주식을 초분산하여 리스크를 극도로 통제하며 시장 수익률 추종.",
+                "summary": "수천 개의 주식을 초분산하여 리스크를 극도로 통제하며 빅테크 중심의 콜/풋 옵션 양방향 헷징.",
                 "top_holdings": [
                     {"company": "NVIDIA", "ticker": "NVDA", "percent": 1.5},
                     {"company": "Microsoft", "ticker": "MSFT", "percent": 1.2},
                     {"company": "Apple", "ticker": "AAPL", "percent": 1.1},
                     {"company": "Amazon", "ticker": "AMZN", "percent": 0.9},
-                    {"company": "Meta Platforms", "ticker": "META", "percent": 0.8},
-                    {"company": "Alphabet", "ticker": "GOOGL", "percent": 0.7},
-                    {"company": "Tesla", "ticker": "TSLA", "percent": 0.6},
-                    {"company": "Broadcom", "ticker": "AVGO", "percent": 0.5},
-                    {"company": "Eli Lilly", "ticker": "LLY", "percent": 0.5},
-                    {"company": "JPMorgan", "ticker": "JPM", "percent": 0.4}
+                    {"company": "Meta Platforms", "ticker": "META", "percent": 0.8}
                 ]
             }
         ]
@@ -436,15 +414,14 @@ def get_calendar(tickers: str = ""):
     if not tickers:
         return {"status": "success", "calendar": []}
 
+    session = get_yf_session()
     ticker_list = [t.strip().upper() for t in tickers.split(",")]
     calendar_data = []
 
     for t in ticker_list:
         try:
-            stock = yf.Ticker(t)
+            stock = yf.Ticker(t, session=session)
             info = stock.info
-            
-            # 1. 완벽한 미래 실적발표일 필터링 (과거 날짜 제외)
             next_earnings = "미정"
             try:
                 earnings = stock.get_earnings_dates(limit=10)
@@ -456,10 +433,8 @@ def get_calendar(tickers: str = ""):
             except:
                 pass
             
-            # 2. 배당락일 및 배당금/배당수익률 추출
             div_date = info.get("exDividendDate")
             next_div = datetime.fromtimestamp(div_date).strftime('%Y-%m-%d') if div_date else "배당 없음"
-            
             div_rate = info.get("dividendRate", "N/A")
             div_yield = info.get("dividendYield", "N/A")
             if isinstance(div_yield, (float, int)):
@@ -473,12 +448,6 @@ def get_calendar(tickers: str = ""):
                 "div_yield": div_yield
             })
         except:
-            calendar_data.append({
-                "ticker": t,
-                "next_earnings": "조회 실패",
-                "next_dividend": "조회 실패",
-                "div_rate": "N/A",
-                "div_yield": "N/A"
-            })
+            pass
             
     return {"status": "success", "calendar": calendar_data}
