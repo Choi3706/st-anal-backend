@@ -18,6 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 👇 이 4줄을 새로 추가합니다. (앱이 서버 상태를 체크할 가벼운 주소) 👇
+@app.get("/api/health")
+def health_check():
+    return {"status": "online"}
+
 GNEWS_KEY = "651b77a31242ef76da2e1567a9975c7e"
 
 def get_yf_session():
